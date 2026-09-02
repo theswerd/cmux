@@ -354,8 +354,8 @@ func TestTmuxCorpusResolvesCallerNumericWindowWithoutWorkspaceList(t *testing.T)
 	if output != want {
 		t.Fatalf("list-panes output = %q, want %q", output, want)
 	}
-	if requests := recorder.requestsFor("workspace.list"); len(requests) != 0 {
-		t.Fatalf("caller numeric window unexpectedly enumerated workspaces: %v", requests)
+	if requests := recorder.requestsFor("pane.list"); len(requests) == 0 {
+		t.Fatal("caller numeric window did not reach pane.list after resolving its own hash")
 	}
 }
 

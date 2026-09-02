@@ -715,6 +715,16 @@ func tmuxResolveWorkspaceId(rc *rpcContext, raw string) (string, error) {
 	if isUUIDish(token) {
 		return token, nil
 	}
+	// Claude Code first asks for the current window's tmux-style numeric ID and
+	// then uses that ID as a target (for example, `list-panes -t @123`). The
+	// authenticated caller already carries the canonical workspace UUID, so
+	// resolve its own stable hash locally instead of calling workspace.list.
+	// The relay deliberately rejects that unscoped enumeration to prevent a
+	// remote workspace from learning the local workspace topology.
+	if caller := tmuxCallerWorkspaceHandle(); isUUIDish(caller) &&
+		tmuxNumericIdMatches(token, caller) {
+		return caller, nil
+	}
 
 	// Try to resolve as ref, tmux numeric id, or workspace index.
 	items, err := tmuxWorkspaceItems(rc)
