@@ -326,6 +326,39 @@ func TestTmuxCorpusNewSessionAndNewWindowCommandsDispatchShellText(t *testing.T)
 	}
 }
 
+// Regression: Claude Code's tmux backend first resolves the current window to
+// a numeric `@<window-id>` and then asks for `list-panes -t @<window-id>`.
+// Remote relay policy intentionally rejects an unscoped workspace.list, so
+// the caller's own stable numeric window ID must resolve from its authenticated
+// CMUX_WORKSPACE_ID without enumerating every local workspace.
+func TestTmuxCorpusResolvesCallerNumericWindowWithoutWorkspaceList(t *testing.T) {
+	const workspaceID = "11111111-1111-4111-8111-111111111111"
+	t.Setenv("CMUX_WORKSPACE_ID", workspaceID)
+	t.Setenv("CMUX_SURFACE_ID", "44444444-4444-4444-8444-444444444444")
+	t.Setenv("CMUX_PANE_ID", "33333333-3333-4333-8333-333333333333")
+
+	recorder := startTmuxCorpusRPCRecorder(t)
+	recorder.setMethodFails("workspace.list", true)
+	rc := &rpcContext{socketPath: recorder.socketPath}
+
+	output := captureStdout(t, func() {
+		err := dispatchTmuxCommand(rc, "list-panes", []string{
+			"-t", "@" + tmuxStableNumericId(workspaceID), "-F", "#{pane_id}",
+		})
+		if err != nil {
+			t.Fatalf("list-panes for caller numeric window: %v", err)
+		}
+	})
+
+	want := "%" + tmuxStableNumericId("33333333-3333-4333-8333-333333333333") + "\n"
+	if output != want {
+		t.Fatalf("list-panes output = %q, want %q", output, want)
+	}
+	if requests := recorder.requestsFor("workspace.list"); len(requests) != 0 {
+		t.Fatalf("caller numeric window unexpectedly enumerated workspaces: %v", requests)
+	}
+}
+
 // Regression: Claude Code agent-team teammate panes respawn with
 // `respawn-pane -k -t %<paneID> <command>`. The Swift/local `__tmux-compat`
 // path supports this, but the Go relay path used for SSH sessions did not,
