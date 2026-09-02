@@ -371,6 +371,7 @@ struct Inner {
     shell_sessions: Mutex<HashMap<String, Arc<ShellSession>>>,
     shell_starting: Mutex<HashMap<String, Arc<Notify>>>,
     auth: Mutex<Option<AuthSnapshot>>,
+    control_users: Mutex<HashMap<usize, Arc<AtomicUsize>>>,
 }
 
 struct ShellStartReservation {
@@ -422,6 +423,7 @@ impl PtyManager {
                 shell_sessions: Mutex::new(HashMap::new()),
                 shell_starting: Mutex::new(HashMap::new()),
                 auth: Mutex::new(None),
+                control_users: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -448,6 +450,7 @@ impl PtyManager {
                 shell_sessions: Mutex::new(HashMap::new()),
                 shell_starting: Mutex::new(HashMap::new()),
                 auth: Mutex::new(None),
+                control_users: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -599,6 +602,33 @@ fn send_typed_pty_error(
 }
 
 impl Inner {
+    fn control_key(control: &Arc<dyn ControlHandle>) -> usize {
+        Arc::as_ptr(control) as *const () as usize
+    }
+
+    fn register_control_user(&self, control: &Arc<dyn ControlHandle>) -> Arc<AtomicUsize> {
+        let key = Self::control_key(control);
+        let users = {
+            let mut controls = self.control_users.lock().expect("control users lock");
+            controls.entry(key).or_insert_with(|| Arc::new(AtomicUsize::new(0))).clone()
+        };
+        users.fetch_add(1, Ordering::SeqCst);
+        users
+    }
+
+    fn end_control_if_unshared(&self, control: &Arc<dyn ControlHandle>) {
+        let key = Self::control_key(control);
+        let shared = self
+            .control_users
+            .lock()
+            .expect("control users lock")
+            .get(&key)
+            .is_some_and(|users| users.load(Ordering::SeqCst) != 0);
+        if !shared {
+            control.end();
+        }
+    }
+
     async fn open(self: Arc<Self>, frame: &Value, context: &FrameContext) {
         let pty_id = frame.get("ptyId").and_then(Value::as_str).unwrap_or_default().to_owned();
         if pty_id.is_empty() {
@@ -1495,6 +1525,7 @@ struct ControlTerminalControl {
     surface_id: i64,
     lease: Option<String>,
     detach_supported: bool,
+    control_users: Arc<AtomicUsize>,
 }
 
 impl PtyControl for ControlTerminalControl {
@@ -1519,15 +1550,19 @@ impl PtyControl for ControlTerminalControl {
             let Some(lease) = self.lease.as_deref() else {
                 // A missing lease cannot be safely replaced with a broad
                 // connection close because another attachment may share it.
+                self.control_users.fetch_sub(1, Ordering::SeqCst);
                 return;
             };
             self.control.send(
                 "detach-attached-view",
                 json!({ "surface": self.surface_id, "lease": lease }),
             );
+            self.control_users.fetch_sub(1, Ordering::SeqCst);
             return;
         }
-        self.control.end(); // detach only; the daemon keeps the terminal
+        if self.control_users.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.control.end();
+        }
     }
 }
 
@@ -1716,7 +1751,7 @@ impl Inner {
             .and_then(Value::as_i64)
             .unwrap_or(0);
         if protocol < CONTROL_MIN_PROTOCOL {
-            control.end();
+            self.end_control_if_unshared(&control);
             return Ok(None);
         }
         let capabilities: Vec<String> = info
@@ -1743,6 +1778,13 @@ impl Inner {
                 )
                 .await
                 .is_some_and(|response| response.get("ok").and_then(Value::as_bool) == Some(true));
+        if scoped_detach_advertised && !detach_supported {
+            self.end_control_if_unshared(&control);
+            return Err((
+                RelayPtyErrorCode::Failed,
+                "cannot confirm scoped attachment cleanup with this peer".to_owned(),
+            ));
+        }
 
         // Resolve the ref: numeric surface id directly, else via the tree.
         let mut surface_id: Option<i64> = if surface_ref.bytes().all(|b| b.is_ascii_digit()) {
@@ -1763,7 +1805,7 @@ impl Inner {
                 .map(|tab| tab.surface_id);
         }
         let Some(surface_id) = surface_id else {
-            control.end();
+            self.end_control_if_unshared(&control);
             // Typed refusal: the terminal died with its process (or its tab
             // closed) — permanent, so clients render an ended state and
             // never offer a retry.
@@ -1786,14 +1828,14 @@ impl Inner {
                 .and_then(|v| v.get("cwd"))
                 .and_then(Value::as_str);
             if actual.is_none_or(|value| value.is_empty() || !Path::new(value).is_absolute()) {
-                control.end();
+                self.end_control_if_unshared(&control);
                 return Err((
                     RelayPtyErrorCode::Failed,
                     "cannot prove existing surface cwd is within allowed roots".to_owned(),
                 ));
             }
             let Some(actual) = actual else {
-                control.end();
+                self.end_control_if_unshared(&control);
                 return Err((
                     RelayPtyErrorCode::Failed,
                     "cannot prove existing surface cwd is within allowed roots".to_owned(),
@@ -1802,7 +1844,7 @@ impl Inner {
             if scoped_cwd(Some(actual), &self.home, context.local_roots.as_deref(), server_roots)
                 .is_err()
             {
-                control.end();
+                self.end_control_if_unshared(&control);
                 return Err((
                     RelayPtyErrorCode::Failed,
                     "existing surface cwd is outside allowed roots".to_owned(),
@@ -1868,7 +1910,7 @@ impl Inner {
             // A peer that advertises scoped detach must return the lease that
             // identifies this stream. Without it, admitting the attachment
             // would leave cancellation unable to clean up the remote stream.
-            control.end();
+            self.end_control_if_unshared(&control);
             return Err((
                 RelayPtyErrorCode::Failed,
                 "attach-surface response omitted required attachment lease".to_owned(),
@@ -1896,7 +1938,7 @@ impl Inner {
             }
         }
         if !attach_succeeded {
-            control.end();
+            self.end_control_if_unshared(&control);
             let reason = attached
                 .as_ref()
                 .and_then(|v| v.get("error"))
@@ -1908,8 +1950,14 @@ impl Inner {
             ));
         }
 
-        let proxy =
-            Arc::new(ControlTerminalControl { control, surface_id, lease, detach_supported });
+        let control_users = self.register_control_user(&control);
+        let proxy = Arc::new(ControlTerminalControl {
+            control,
+            surface_id,
+            lease,
+            detach_supported,
+            control_users,
+        });
         let (on_data, _) = self.sinks(pty_id, context);
         let relay = Arc::clone(&self);
         let context_for_exit = context.clone();
@@ -2147,6 +2195,7 @@ mod tests {
 
     struct ConcurrentAttachControl {
         advertise_leases: bool,
+        registration_succeeds: bool,
         attach_requests: AtomicUsize,
         detach_requests: AtomicUsize,
         ends: AtomicUsize,
@@ -2176,6 +2225,10 @@ mod tests {
                     self.attach_requests.fetch_add(1, AtomicOrdering::SeqCst);
                     Box::pin(async { Some(json!({ "ok": true })) })
                 }
+                "set-client-info" => {
+                    let ok = self.registration_succeeds;
+                    Box::pin(async move { Some(json!({ "ok": ok })) })
+                }
                 _ => Box::pin(async { Some(json!({ "ok": true })) }),
             }
         }
@@ -2198,6 +2251,7 @@ mod tests {
     async fn canceled_attachment_does_not_end_control_for_concurrent_attachment() {
         let control = TestArc::new(ConcurrentAttachControl {
             advertise_leases: false,
+            registration_succeeds: true,
             attach_requests: AtomicUsize::new(0),
             detach_requests: AtomicUsize::new(0),
             ends: AtomicUsize::new(0),
@@ -2259,6 +2313,7 @@ mod tests {
     async fn attach_without_advertised_lease_fails_closed() {
         let control = TestArc::new(ConcurrentAttachControl {
             advertise_leases: true,
+            registration_succeeds: true,
             attach_requests: AtomicUsize::new(0),
             detach_requests: AtomicUsize::new(0),
             ends: AtomicUsize::new(0),
@@ -2277,6 +2332,29 @@ mod tests {
         assert!(h.sent().iter().any(|frame| {
             frame["ptyId"] == "p1" && frame["type"] == "pty_error" && frame["code"] == "failed"
         }));
+    }
+
+    #[tokio::test]
+    async fn attach_rejects_when_scoped_detach_registration_fails() {
+        let control = TestArc::new(ConcurrentAttachControl {
+            advertise_leases: true,
+            registration_succeeds: false,
+            attach_requests: AtomicUsize::new(0),
+            detach_requests: AtomicUsize::new(0),
+            ends: AtomicUsize::new(0),
+        });
+        let h = harness_with_control(
+            Some(CmuxTui { file: "/bin/cmux-tui".to_owned(), prefix: Vec::new() }),
+            None,
+            None,
+            Some(control.clone()),
+        );
+        h.open("p1", "main", serde_json::json!({ "surface": "7" }), "supervised", h.owner.clone())
+            .await;
+
+        assert_eq!(control.attach_requests.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(control.ends.load(AtomicOrdering::SeqCst), 1);
+        assert!(!h.manager.has_attachment("p1"));
     }
 
     /// A unique, real directory for tests that exercise cwd canonicalization.
