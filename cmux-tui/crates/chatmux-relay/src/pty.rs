@@ -2134,6 +2134,7 @@ mod tests {
     }
 
     struct ConcurrentAttachControl {
+        advertise_leases: bool,
         attach_requests: AtomicUsize,
         detach_requests: AtomicUsize,
         ends: AtomicUsize,
@@ -2147,9 +2148,16 @@ mod tests {
         ) -> std::pin::Pin<Box<dyn Future<Output = Option<Value>> + Send + '_>> {
             match cmd {
                 "identify" => Box::pin(async {
+                    let capabilities = if self.advertise_leases {
+                        json!(
+                            [VIEW_ATTACHMENT_LEASE_CAPABILITY, VIEW_ATTACHMENT_DETACH_CAPABILITY,]
+                        )
+                    } else {
+                        json!([])
+                    };
                     Some(json!({
                         "ok": true,
-                        "data": { "protocol": CONTROL_MIN_PROTOCOL, "capabilities": [] },
+                        "data": { "protocol": CONTROL_MIN_PROTOCOL, "capabilities": capabilities },
                     }))
                 }),
                 "attach-surface" => {
@@ -2177,6 +2185,7 @@ mod tests {
     #[tokio::test]
     async fn canceled_attachment_does_not_end_control_for_concurrent_attachment() {
         let control = TestArc::new(ConcurrentAttachControl {
+            advertise_leases: false,
             attach_requests: AtomicUsize::new(0),
             detach_requests: AtomicUsize::new(0),
             ends: AtomicUsize::new(0),
@@ -2232,6 +2241,30 @@ mod tests {
         let sent = h.sent();
         assert!(sent.iter().any(|frame| frame["ptyId"] == "p1" && frame["type"] == "pty_error"));
         assert!(sent.iter().any(|frame| frame["ptyId"] == "p2" && frame["type"] == "pty_opened"));
+    }
+
+    #[tokio::test]
+    async fn attach_without_advertised_lease_fails_closed() {
+        let control = TestArc::new(ConcurrentAttachControl {
+            advertise_leases: true,
+            attach_requests: AtomicUsize::new(0),
+            detach_requests: AtomicUsize::new(0),
+            ends: AtomicUsize::new(0),
+        });
+        let h = harness_with_control(
+            Some(CmuxTui { file: "/bin/cmux-tui".to_owned(), prefix: Vec::new() }),
+            None,
+            None,
+            Some(control.clone()),
+        );
+        h.open("p1", "main", serde_json::json!({ "surface": "7" }), "supervised", h.owner.clone())
+            .await;
+
+        assert!(!h.manager.has_attachment("p1"));
+        assert_eq!(control.ends.load(AtomicOrdering::SeqCst), 1);
+        assert!(h.sent().iter().any(|frame| {
+            frame["ptyId"] == "p1" && frame["type"] == "pty_error" && frame["code"] == "failed"
+        }));
     }
 
     /// A unique, real directory for tests that exercise cwd canonicalization.
