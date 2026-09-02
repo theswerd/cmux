@@ -1862,6 +1862,18 @@ impl Inner {
             .and_then(|data| data.get("lease"))
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let attach_succeeded =
+            attached.as_ref().and_then(|v| v.get("ok")).and_then(Value::as_bool) == Some(true);
+        if attach_succeeded && scoped_detach_advertised && lease.is_none() {
+            // A peer that advertises scoped detach must return the lease that
+            // identifies this stream. Without it, admitting the attachment
+            // would leave cancellation unable to clean up the remote stream.
+            control.end();
+            return Err((
+                RelayPtyErrorCode::Failed,
+                "attach-surface response omitted required attachment lease".to_owned(),
+            ));
+        }
         if context.cancellation.is_cancelled() {
             if detach_supported && let Some(lease) = lease.as_deref() {
                 let detached = control
@@ -1883,7 +1895,7 @@ impl Inner {
                 // the live attachment instead of abandoning a remote stream.
             }
         }
-        if attached.as_ref().and_then(|v| v.get("ok")).and_then(Value::as_bool) != Some(true) {
+        if !attach_succeeded {
             control.end();
             let reason = attached
                 .as_ref()
